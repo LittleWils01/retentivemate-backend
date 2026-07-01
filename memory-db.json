@@ -1,0 +1,14 @@
+{
+  "sheyi": [
+    "i love my mymmy",
+    "I love football",
+    {
+      "type": "preference",
+      "text": "remove I love football",
+      "importance": 2,
+      "timestamp": 1782890496958
+    }
+  ],
+  "Sheyi": [],
+  "SHEYI": []
+}
