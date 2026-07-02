@@ -4,7 +4,13 @@ const express = require("express");
 const cors = require("cors");
 const { GoogleGenAI } = require("@google/genai");
 
-const { getMemory, saveMemory } = require("./storage");
+// MemWal (safe optional import)
+let MemWal;
+try {
+    MemWal = require("@mysten-incubation/memwal").MemWal;
+} catch (e) {
+    console.warn("MemWal not available, using fallback memory");
+}
 
 const app = express();
 
@@ -25,26 +31,85 @@ const ai = new GoogleGenAI({
 });
 
 /* =========================
-   🧠 AI FUNCTION
+   🧠 MEMORY SYSTEM (MEMWAL + FALLBACK)
 ========================= */
 
-async function generateReply(message, memories = []) {
+const memwal = MemWal
+    ? new MemWal({ namespace: "retentivemate-ai" })
+    : null;
 
-    const memoryContext =
-        memories.length > 0
-            ? memories.slice(-10).map(m => `- ${m.text}`).join("\n")
-            : "No stored memories yet.";
+// fallback memory
+const localMemory = {};
+
+/* =========================
+   MEMORY HELPERS
+========================= */
+
+async function loadMemory(userId) {
+    if (memwal) {
+        try {
+            return (await memwal.get(userId)) || [];
+        } catch (e) {
+            console.error("MemWal load error:", e);
+        }
+    }
+
+    return localMemory[userId] || [];
+}
+
+async function saveMemory(userId, memory) {
+    if (memwal) {
+        try {
+            await memwal.set(userId, memory);
+            return;
+        } catch (e) {
+            console.error("MemWal save error:", e);
+        }
+    }
+
+    localMemory[userId] = memory;
+}
+
+/* =========================
+   🧠 MEMORY RULE
+========================= */
+
+function shouldSaveMemory(message) {
+    const m = message.toLowerCase();
+
+    return (
+        m.includes("i am") ||
+        m.includes("my name is") ||
+        m.includes("i like") ||
+        m.includes("i love") ||
+        m.includes("my favorite") ||
+        m.includes("i live") ||
+        m.includes("i work") ||
+        m.includes("i study")
+    );
+}
+
+/* =========================
+   🤖 GEMINI ENGINE
+========================= */
+
+async function generateReply(message, memory) {
+
+    const memoryContext = memory.length
+        ? memory.slice(-10).map(m => `- ${m.text || m.message}`).join("\n")
+        : "No stored memories yet.";
 
     const prompt = `
-You are RetentiveMate, an intelligent AI assistant with persistent memory.
+You are RetentiveMate, a smart conversational AI assistant.
 
 RULES:
-- Be natural, friendly, and conversational
-- Never say "I will remember", "memory saved", or anything like that
-- Use memory only when relevant
-- Keep responses short and helpful
+- Be natural and human-like
+- Respond like ChatGPT
+- Understand greetings (hi, hello)
+- Ask questions when needed
+- NEVER say "Noted" or "I will remember"
 
-User memories:
+User memory:
 ${memoryContext}
 
 User message:
@@ -60,121 +125,28 @@ ${message}
 }
 
 /* =========================
-   🧠 MEMORY SAVER (SILENT)
-========================= */
-
-function shouldSaveMemory(message) {
-    const m = message.toLowerCase();
-
-    return (
-        m.includes("i am") ||
-        m.includes("my name is") ||
-        m.includes("i like") ||
-        m.includes("i love") ||
-        m.includes("my favorite") ||
-        m.includes("i work") ||
-        m.includes("i study") ||
-        m.includes("i live") ||
-        m.includes("my birthday is")
-    );
-}
-
-/* =========================
    🚀 ROUTES
 ========================= */
 
-// HEALTH CHECK
 app.get("/", (req, res) => {
     res.send("🔥 RetentiveMate AI is running");
 });
 
-// TEST AI
-app.post("/test-ai", async (req, res) => {
-    try {
-        const { message } = req.body;
-
-        const reply = await generateReply(message, []);
-
-        return res.json({ reply });
-
-    } catch (err) {
-        console.error("TEST AI ERROR:", err);
-        return res.status(500).json({
-            reply: "AI error occurred"
-        });
-    }
-});
-
-// MAIN CHAT ROUTE
 app.post("/chat", async (req, res) => {
     try {
         const { userId, message } = req.body;
 
         if (!userId || !message) {
             return res.status(400).json({
-                reply: "userId and message are required"
+                reply: "userId and message required"
             });
         }
 
-        // Load memory
-        let memory = await getMemory(userId);
+        let memory = await loadMemory(userId);
 
-        // Build memory context (last 10 only)
-        const memoryContext =
-            memory.length > 0
-                ? memory.slice(-10).map(m => `- ${m.text}`).join("\n")
-                : "No stored memories yet.";
+        const reply = await generateReply(message, memory);
 
-        // 🔥 STRICT AI PROMPT (IMPORTANT FIX)
-        const prompt = `
-You are RetentiveMate, a highly intelligent conversational AI.
-
-You MUST behave like a real assistant.
-
-RULES:
-- You must ALWAYS respond to the user's message naturally.
-- You MUST recognize greetings (hi, hello, how are you) and respond warmly.
-- You MUST ask follow-up questions when appropriate.
-- You MUST NOT say "noted", "I will remember", or anything about saving memory.
-- You are NOT a storage bot. You are a conversational AI.
-
-Conversation style:
-- Friendly
-- Natural
-- Human-like
-- Helpful
-
-User memories:
-${memoryContext}
-
-User message:
-${message}
-
-Respond naturally:
-`;
-
-        // Call Gemini
-        const response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            contents: prompt
-        });
-
-        const reply = response.text;
-
-        // 🧠 MEMORY SAVING (DO NOT AFFECT RESPONSE)
-        const m = message.toLowerCase();
-
-        const shouldSave =
-            m.includes("i am") ||
-            m.includes("my name is") ||
-            m.includes("i like") ||
-            m.includes("i love") ||
-            m.includes("my favorite") ||
-            m.includes("i live") ||
-            m.includes("i work") ||
-            m.includes("i study");
-
-        if (shouldSave) {
+        if (shouldSaveMemory(message)) {
             memory.push({
                 text: message,
                 timestamp: Date.now()
@@ -189,9 +161,9 @@ Respond naturally:
         });
 
     } catch (err) {
-        console.error("CHAT ERROR:", err);
+        console.error(err);
         return res.status(500).json({
-            reply: "Something went wrong"
+            reply: "AI error occurred"
         });
     }
 });
@@ -200,8 +172,8 @@ Respond naturally:
    🚀 START SERVER
 ========================= */
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🔥 RetentiveMate AI running at http://localhost:${PORT}`);
+    console.log(`🔥 Server running on port ${PORT}`);
 });
