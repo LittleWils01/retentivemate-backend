@@ -1,5 +1,10 @@
+require("dotenv").config();
+
 const express = require("express");
 const cors = require("cors");
+const { GoogleGenAI } = require("@google/genai");
+
+const { getMemory, saveMemory } = require("./storage");
 
 const app = express();
 
@@ -11,213 +16,184 @@ app.use(cors({
 
 app.use(express.json());
 
-const { getMemory, saveMemory } = require("./storage");
-
 /* =========================
-   🧠 HELPER FUNCTIONS
+   🤖 GEMINI SETUP
 ========================= */
 
-// CLASSIFY MEMORY TYPE
-function classifyMemory(msg) {
-    const m = msg.toLowerCase();
+const ai = new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY
+});
 
-    if (m.startsWith("i am") || m.includes("my name is")) return "identity";
-    if (m.includes("i love") || m.includes("i like") || m.includes("my favorite")) return "preference";
-    if (m.includes("i live") || m.includes("i work") || m.includes("i study")) return "lifestyle";
+/* =========================
+   🧠 AI FUNCTION
+========================= */
 
-    return null;
+async function generateReply(message, memories = []) {
+
+    const memoryContext =
+        memories.length > 0
+            ? memories.slice(-10).map(m => `- ${m.text}`).join("\n")
+            : "No stored memories yet.";
+
+    const prompt = `
+You are RetentiveMate, an intelligent AI assistant with persistent memory.
+
+RULES:
+- Be natural, friendly, and conversational
+- Never say "I will remember", "memory saved", or anything like that
+- Use memory only when relevant
+- Keep responses short and helpful
+
+User memories:
+${memoryContext}
+
+User message:
+${message}
+`;
+
+    const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt
+    });
+
+    return response.text;
 }
 
-// PROFILE SUMMARY
-function generateSummary(memory) {
+/* =========================
+   🧠 MEMORY SAVER (SILENT)
+========================= */
 
-    const identity = memory.filter(m => m.type === "identity");
-    const preference = memory.filter(m => m.type === "preference");
-    const lifestyle = memory.filter(m => m.type === "lifestyle");
+function shouldSaveMemory(message) {
+    const m = message.toLowerCase();
 
-    let summary = "🧠 Your profile summary:\n\n";
-
-    if (identity.length) {
-        summary += `👤 Identity: ${identity.map(m => m.text).join(", ")}\n`;
-    }
-
-    if (preference.length) {
-        summary += `❤️ Likes: ${preference.map(m => m.text).join(", ")}\n`;
-    }
-
-    if (lifestyle.length) {
-        summary += `🏠 Lifestyle: ${lifestyle.map(m => m.text).join(", ")}\n`;
-    }
-
-    summary += "\n✨ You are a unique individual with stored preferences and habits.";
-
-    return summary;
-}
-
-// INSIGHTS ENGINE
-function getMemoryInsights(memory) {
-
-    const preferences = memory.filter(m => m.type === "preference").length;
-    const identity = memory.filter(m => m.type === "identity").length;
-    const lifestyle = memory.filter(m => m.type === "lifestyle").length;
-
-    let insights = [];
-
-    if (preferences >= 2) {
-        insights.push("❤️ You talk a lot about your preferences and likes.");
-    }
-
-    if (identity >= 1) {
-        insights.push("👤 I know your identity details.");
-    }
-
-    if (lifestyle >= 2) {
-        insights.push("🏠 You’ve shared lifestyle information about yourself.");
-    }
-
-    if (preferences === 0 && identity === 0 && lifestyle === 0) {
-        insights.push("🧠 I’m still learning about you.");
-    }
-
-    return insights;
+    return (
+        m.includes("i am") ||
+        m.includes("my name is") ||
+        m.includes("i like") ||
+        m.includes("i love") ||
+        m.includes("my favorite") ||
+        m.includes("i work") ||
+        m.includes("i study") ||
+        m.includes("i live") ||
+        m.includes("my birthday is")
+    );
 }
 
 /* =========================
    🚀 ROUTES
 ========================= */
 
-// HOME
+// HEALTH CHECK
 app.get("/", (req, res) => {
-    res.send("🤖 RetentiveMate AI is running");
+    res.send("🔥 RetentiveMate AI is running");
 });
 
-// CHAT ROUTE
+// TEST AI
+app.post("/test-ai", async (req, res) => {
+    try {
+        const { message } = req.body;
+
+        const reply = await generateReply(message, []);
+
+        return res.json({ reply });
+
+    } catch (err) {
+        console.error("TEST AI ERROR:", err);
+        return res.status(500).json({
+            reply: "AI error occurred"
+        });
+    }
+});
+
+// MAIN CHAT ROUTE
 app.post("/chat", async (req, res) => {
+    try {
+        const { userId, message } = req.body;
 
-    const { userId, message } = req.body;
-
-    if (!userId || !message) {
-        return res.json({
-            reply: "User ID and message required",
-            memory: []
-        });
-    }
-
-    let memory = await getMemory(userId);
-    const lower = message.toLowerCase();
-
-    /* -------------------------
-       🧠 WHO AM I / SUMMARY
-    --------------------------*/
-    if (
-        lower.includes("who am i") ||
-        lower.includes("what do you know about me") ||
-        lower.includes("tell me about myself")
-    ) {
-        if (memory.length === 0) {
-            return res.json({
-                reply: "I don't know anything about you yet. Tell me about yourself!",
-                memory
+        if (!userId || !message) {
+            return res.status(400).json({
+                reply: "userId and message are required"
             });
         }
 
-        return res.json({
-            reply: generateSummary(memory),
-            memory
+        // Load memory
+        let memory = await getMemory(userId);
+
+        // Build memory context (last 10 only)
+        const memoryContext =
+            memory.length > 0
+                ? memory.slice(-10).map(m => `- ${m.text}`).join("\n")
+                : "No stored memories yet.";
+
+        // 🔥 STRICT AI PROMPT (IMPORTANT FIX)
+        const prompt = `
+You are RetentiveMate, a highly intelligent conversational AI.
+
+You MUST behave like a real assistant.
+
+RULES:
+- You must ALWAYS respond to the user's message naturally.
+- You MUST recognize greetings (hi, hello, how are you) and respond warmly.
+- You MUST ask follow-up questions when appropriate.
+- You MUST NOT say "noted", "I will remember", or anything about saving memory.
+- You are NOT a storage bot. You are a conversational AI.
+
+Conversation style:
+- Friendly
+- Natural
+- Human-like
+- Helpful
+
+User memories:
+${memoryContext}
+
+User message:
+${message}
+
+Respond naturally:
+`;
+
+        // Call Gemini
+        const response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            contents: prompt
         });
-    }
 
-    /* -------------------------
-       🧠 INSIGHTS
-    --------------------------*/
-    if (
-        lower.includes("insights") ||
-        lower.includes("what do you think about me")
-    ) {
-        const insights = getMemoryInsights(memory);
+        const reply = response.text;
 
-        return res.json({
-            reply: `🧠 Here’s what I’ve noticed about you:\n\n${insights.join("\n")}`,
-            memory
-        });
-    }
+        // 🧠 MEMORY SAVING (DO NOT AFFECT RESPONSE)
+        const m = message.toLowerCase();
 
-    /* -------------------------
-       🗑️ FORGET MEMORY
-    --------------------------*/
-    if (lower.startsWith("forget ")) {
-        const keyword = lower.replace("forget ", "").trim();
+        const shouldSave =
+            m.includes("i am") ||
+            m.includes("my name is") ||
+            m.includes("i like") ||
+            m.includes("i love") ||
+            m.includes("my favorite") ||
+            m.includes("i live") ||
+            m.includes("i work") ||
+            m.includes("i study");
 
-        memory = memory.filter(m =>
-            !m.text.toLowerCase().includes(keyword)
-        );
-
-        await saveMemory(userId, memory);
-
-        return res.json({
-            reply: `🗑️ I’ve forgotten anything related to "${keyword}".`,
-            memory
-        });
-    }
-
-    /* -------------------------
-       🔍 SEARCH MEMORY
-    --------------------------*/
-    if (lower.startsWith("do i") || lower.startsWith("am i")) {
-
-        const keyword = lower.split(" ").slice(-1)[0];
-
-        const results = memory.filter(m =>
-            m.text.toLowerCase().includes(keyword)
-        );
-
-        if (results.length === 0) {
-            return res.json({
-                reply: "I couldn't find anything about that.",
-                memory
+        if (shouldSave) {
+            memory.push({
+                text: message,
+                timestamp: Date.now()
             });
+
+            await saveMemory(userId, memory);
         }
 
         return res.json({
-            reply: `🔍 Here's what I found:\n\n` +
-                results.map((m, i) => `${i + 1}. ${m.text}`).join("\n"),
+            reply,
             memory
         });
-    }
 
-    /* -------------------------
-       💾 SAVE MEMORY
-    --------------------------*/
-    const type = classifyMemory(message);
-
-    if (type) {
-
-        const memoryItem = {
-            type,
-            text: message,
-            importance:
-                type === "identity" ? 3 :
-                type === "preference" ? 2 : 1,
-            timestamp: Date.now()
-        };
-
-        memory.push(memoryItem);
-
-        await saveMemory(userId, memory);
-
-        return res.json({
-            reply: `✅ Got it. I've saved your ${type} info.`,
-            memory
+    } catch (err) {
+        console.error("CHAT ERROR:", err);
+        return res.status(500).json({
+            reply: "Something went wrong"
         });
     }
-
-    /* -------------------------
-       🤖 DEFAULT RESPONSE
-    --------------------------*/
-    return res.json({
-        reply: "👍 Noted. If it's important, I'll remember it.",
-        memory
-    });
 });
 
 /* =========================
